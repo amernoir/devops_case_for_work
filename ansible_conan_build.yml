@@ -1,0 +1,129 @@
+---
+- name: Build C++ Conan project on Debian VM
+  hosts: debian_vm
+  become: yes
+  vars:
+    local_project_dir: "./conan_cpp_project"
+    remote_project_dir: "/home/user/conan_cpp_project"
+    
+  tasks:
+    # === Установка зависимостей ===
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install build tools and Python
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-venv
+          - g++
+          - cmake
+          - make
+          - git
+          - pkg-config
+        state: present
+
+    - name: Install Conan via pip
+      pip:
+        name: conan
+        state: present
+        executable: pip3
+
+    - name: Configure Conan (create default profile)
+      shell: |
+        conan profile detect --force
+      args:
+        executable: /bin/bash
+      environment:
+        CONAN_HOME: /tmp/conan_home
+
+    - name: Clean remote directory
+      file:
+        path: "{{ remote_project_dir }}"
+        state: absent
+
+    - name: Create remote project directory
+      file:
+        path: "{{ remote_project_dir }}"
+        state: directory
+        owner: user
+        group: user
+        mode: '0755'
+
+    - name: Copy project files to VM
+      synchronize:
+        src: "{{ local_project_dir }}/"
+        dest: "{{ remote_project_dir }}"
+        mode: push
+        rsync_opts:
+          - "--exclude=build/"
+          - "--exclude=*.o"
+          - "--exclude=*.so"
+
+    - name: Install Conan dependencies
+      shell: |
+        cd {{ remote_project_dir }} && \
+        conan install . \
+          --output-folder=build \
+          --build=missing \
+          -s compiler.libcxx=libstdc++11
+      args:
+        executable: /bin/bash
+        chdir: "{{ remote_project_dir }}"
+      environment:
+        CONAN_HOME: /tmp/conan_home
+
+    - name: Configure with CMake
+      shell: |
+        cd {{ remote_project_dir }}/build && \
+        cmake .. \
+          -DCMAKE_TOOLCHAIN_FILE=conan_toolchain.cmake \
+          -DCMAKE_BUILD_TYPE=Release
+      args:
+        executable: /bin/bash
+
+    - name: Build project
+      shell: |
+        cd {{ remote_project_dir }}/build && \
+        cmake --build . --parallel $(nproc)
+      args:
+        executable: /bin/bash
+
+    - name: Check if executable exists
+      stat:
+        path: "{{ remote_project_dir }}/build/JsonFormatter"
+      register: executable_result
+
+    - name: Run the executable
+      shell: |
+        cd {{ remote_project_dir }} && \
+        ./build/JsonFormatter
+      args:
+        executable: /bin/bash
+      register: program_output
+      when: executable_result.stat.exists
+
+    - name: Display program output
+      debug:
+        msg: "{{ program_output.stdout_lines }}"
+      when: program_output is defined
+
+    - name: Fetch executable to host
+      fetch:
+        src: "{{ remote_project_dir }}/build/JsonFormatter"
+        dest: "./JsonFormatter_debian"
+        flat: yes
+        mode: '0755'
+      when: executable_result.stat.exists
+
+    - name: Final status
+      debug:
+        msg: |
+          ========= CONAN BUILD COMPLETE =========
+          Project built: {{ executable_result.stat.exists }}
+          Location on VM: {{ remote_project_dir }}/build/
+          Executable on host: ./JsonFormatter_debian
+          ========================================

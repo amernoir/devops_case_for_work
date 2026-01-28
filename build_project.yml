@@ -1,0 +1,248 @@
+---
+- name: Build SQLite3 project on Debian VM
+  hosts: debian_vm
+  become: yes
+  vars:
+    project_name: "sqlite3_amalgamation"
+    remote_dir: "/home/user/{{ project_name }}"
+    build_dir: "{{ remote_dir }}/build-linux"
+    log_file: "{{ remote_dir }}/build_log.txt"
+    
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install build essentials
+      apt:
+        name:
+          - build-essential
+          - gcc
+          - g++
+          - cmake
+          - make
+          - git
+          - pkg-config
+        state: present
+
+    - name: Install additional dependencies
+      apt:
+        name:
+          - libsqlite3-dev
+          - zlib1g-dev
+        state: present
+
+    - name: Create project directory on VM
+      file:
+        path: "{{ remote_dir }}"
+        state: directory
+        owner: user
+        group: user
+        mode: '0755'
+
+    - name: Copy CMakeLists.txt
+      copy:
+        src: "{{ playbook_dir }}/CMakeLists.txt"
+        dest: "{{ remote_dir }}/CMakeLists.txt"
+        owner: user
+        group: user
+        mode: '0644'
+
+    - name: Create src directory on VM
+      file:
+        path: "{{ remote_dir }}/src"
+        state: directory
+        owner: user
+        group: user
+
+    - name: Copy sqlite3.c source file
+      copy:
+        src: "{{ playbook_dir }}/src/sqlite3.c"
+        dest: "{{ remote_dir }}/src/sqlite3.c"
+        owner: user
+        group: user
+        mode: '0644'
+
+    # === ПУНКТ 3b: Компиляция библиотеки с логом ===
+    - name: Create build directory
+      file:
+        path: "{{ build_dir }}"
+        state: directory
+        owner: user
+        group: user
+
+    - name: Configure with CMake (Linux)
+      shell: |
+        echo "=== CMake CONFIGURE START ===" > {{ log_file }}
+        echo "Timestamp: $(date)" >> {{ log_file }}
+        echo "" >> {{ log_file }}
+        
+        cd {{ build_dir }} && \
+        cmake ../ -DCMAKE_BUILD_TYPE=Release \
+                  -DCMAKE_C_COMPILER=gcc \
+                  -DCMAKE_SYSTEM_NAME=Linux 2>&1 | tee -a {{ log_file }}
+        
+        echo "" >> {{ log_file }}
+        echo "=== CMake CONFIGURE END ===" >> {{ log_file }}
+        echo "Exit code: $?" >> {{ log_file }}
+      args:
+        executable: /bin/bash
+      register: cmake_result
+      changed_when: false
+
+    - name: Build SQLite3 library
+      shell: |
+        echo "" >> {{ log_file }}
+        echo "=== MAKE BUILD START ===" >> {{ log_file }}
+        echo "Timestamp: $(date)" >> {{ log_file }}
+        echo "" >> {{ log_file }}
+        
+        cd {{ build_dir }} && \
+        make -j$(nproc) VERBOSE=1 2>&1 | tee -a {{ log_file }}
+        
+        echo "" >> {{ log_file }}
+        echo "=== MAKE BUILD END ===" >> {{ log_file }}
+        echo "Exit code: $?" >> {{ log_file }}
+      args:
+        executable: /bin/bash
+      register: make_result
+
+    - name: Check build result
+      stat:
+        path: "{{ build_dir }}/libsqlite3.so"
+      register: lib_result
+
+    - name: Display build status
+      debug:
+        msg: |
+          Build completed!
+          Library exists: {{ lib_result.stat.exists }}
+          CMake exit code: {{ cmake_result.rc }}
+          Make exit code: {{ make_result.rc }}
+
+    - name: Create test application
+      copy:
+        dest: "{{ remote_dir }}/test_sqlite.c"
+        content: |
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include "src/sqlite3.h"
+          
+          int main() {
+              printf("SQLite3 Test Application\\n");
+              printf("Compiled on Debian VM via Ansible\\n");
+              
+              // Test SQLite version
+              printf("SQLite version: %s\\n", sqlite3_libversion());
+              printf("SQLite source ID: %s\\n", sqlite3_sourceid());
+              
+              // Try to open in-memory database
+              sqlite3 *db;
+              int rc = sqlite3_open(":memory:", &db);
+              
+              if(rc == SQLITE_OK) {
+                  printf("Successfully opened in-memory database\\n");
+                  
+                  // Simple test query
+                  sqlite3_stmt *stmt;
+                  const char *sql = "SELECT sqlite_version()";
+                  
+                  rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+                  if(rc == SQLITE_OK) {
+                      if(sqlite3_step(stmt) == SQLITE_ROW) {
+                          printf("SQLite reports version: %s\\n", 
+                                 sqlite3_column_text(stmt, 0));
+                      }
+                      sqlite3_finalize(stmt);
+                  }
+                  
+                  sqlite3_close(db);
+                  printf("Test completed successfully!\\n");
+              } else {
+                  printf("Failed to open database: %s\\n", sqlite3_errmsg(db));
+                  sqlite3_close(db);
+              }
+              
+              return 0;
+          }
+
+    - name: Compile test application
+      shell: |
+        cd {{ remote_dir }} && \
+        echo "" >> {{ log_file }}
+        echo "=== TEST APP COMPILATION ===" >> {{ log_file }}
+        gcc test_sqlite.c -o test_sqlite_app \
+          -I./src \
+          -L{{ build_dir }} -lsqlite3 \
+          -Wl,-rpath,{{ build_dir }} \
+          -Wall -Wextra 2>&1 | tee -a {{ log_file }}
+      args:
+        executable: /bin/bash
+
+    - name: Make test app executable
+      file:
+        path: "{{ remote_dir }}/test_sqlite_app"
+        mode: '0755'
+        owner: user
+        group: user
+
+    - name: Run test application
+      shell: |
+        cd {{ remote_dir }} && \
+        LD_LIBRARY_PATH={{ build_dir }} ./test_sqlite_app
+      register: test_output
+      args:
+        executable: /bin/bash
+
+    - name: Display test output
+      debug:
+        msg: "{{ test_output.stdout_lines }}"
+
+    - name: List built artifacts
+      shell: |
+        find {{ build_dir }} -name "*.so" -o -name "*.a" | xargs ls -la
+        echo "=== Test app ==="
+        ls -la {{ remote_dir }}/test_sqlite_app
+      register: artifacts
+      args:
+        executable: /bin/bash
+
+    - name: Show artifacts
+      debug:
+        msg: "{{ artifacts.stdout_lines }}"
+
+    - name: Fetch build log to host
+      fetch:
+        src: "{{ log_file }}"
+        dest: "./sqlite_build_log.txt"
+        flat: yes
+
+    - name: Fetch compiled library
+      fetch:
+        src: "{{ build_dir }}/libsqlite3.so"
+        dest: "./libsqlite3_debian.so"
+        flat: yes
+      when: lib_result.stat.exists
+
+    - name: Fetch test application
+      fetch:
+        src: "{{ remote_dir }}/test_sqlite_app"
+        dest: "./test_sqlite_app_debian"
+        flat: yes
+
+    # === Финальный отчет ===
+    - name: Build summary
+      debug:
+        msg: |
+          Project: {{ project_name }}
+          Build directory on VM: {{ build_dir }}
+          Library built: {{ lib_result.stat.exists }}
+          Library file: {{ build_dir }}/libsqlite3.so
+          Test application: {{ remote_dir }}/test_sqlite_app
+          Log file: {{ log_file }}
+          
+          Files downloaded to host:
+          - sqlite_build_log.txt (build log)
+          - libsqlite3_debian.so (compiled library)
+          - test_sqlite_app_debian (test application)

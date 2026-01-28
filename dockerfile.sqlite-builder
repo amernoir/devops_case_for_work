@@ -1,0 +1,26 @@
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY src/ ./src/
+COPY CMakeLists.txt ./
+
+RUN mkdir build && cd build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=ON \
+        -DBUILD_STATIC_LIBS=OFF && \
+    make -j$(nproc)
+
+FROM ubuntu:22.04
+COPY --from=builder /src/build/libsqlite3.so /usr/lib/
+
+RUN ln -sf /usr/lib/libsqlite3.so /usr/lib/libsqlite3.so.3 && \
+    ldconfig
+
+CMD ["/bin/bash", "-c", "echo ' Библиотека готова к использованию' && ldd /usr/lib/libsqlite3.so"]
